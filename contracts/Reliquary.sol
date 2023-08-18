@@ -63,6 +63,8 @@ contract Reliquary is
     PoolInfo[] private poolInfo;
     /// @notice Level system for each Reliquary pool.
     LevelInfo[] private levels;
+    /// @notice Balance info of each tranche (epoch) for each Reliquary pool.
+    TranchesInfo[] private tranches;
     /// @notice Address of the LP token for each Reliquary pool.
     address[] public poolToken;
     /// @notice Address of IRewarder contract for each Reliquary pool.
@@ -75,6 +77,7 @@ contract Reliquary is
     uint public totalAllocPoint;
 
     error NonExistentRelic();
+    error NonExistentLevel();
     error BurningPrincipal();
     error BurningRewards();
     error RewardTokenAsPoolToken();
@@ -118,7 +121,7 @@ contract Reliquary is
      * @param allocPoint The allocation points for the new pool.
      * @param _poolToken Address of the pooled ERC-20 token.
      * @param _rewarder Address of the rewarder delegate.
-     * @param requiredMaturities Array of maturity (in seconds) required to achieve each level for this pool.
+     * @param levelPeriod Duration of each level.
      * @param levelMultipliers The multipliers applied to the amount of `_poolToken` for each level within this pool.
      * @param name Name of pool to be displayed in NFT image.
      * @param _nftDescriptor The contract address for NFTDescriptor, which will return the token URI.
@@ -129,26 +132,13 @@ contract Reliquary is
         uint allocPoint,
         address _poolToken,
         address _rewarder,
-        uint[] calldata requiredMaturities,
+        uint levelPeriod,
         uint[] calldata levelMultipliers,
         string memory name,
         address _nftDescriptor,
         bool allowPartialWithdrawals
     ) external override onlyRole(OPERATOR) {
         if (_poolToken == rewardToken) revert RewardTokenAsPoolToken();
-        if (requiredMaturities.length == 0) revert EmptyArray();
-        if (requiredMaturities.length != levelMultipliers.length) revert ArrayLengthMismatch();
-        if (requiredMaturities[0] != 0) revert NonZeroFirstMaturity();
-        if (requiredMaturities.length > 1) {
-            uint highestMaturity;
-            for (uint i = 1; i < requiredMaturities.length;) {
-                if (requiredMaturities[i] <= highestMaturity) revert UnsortedMaturityLevels();
-                highestMaturity = requiredMaturities[i];
-                unchecked {
-                    ++i;
-                }
-            }
-        }
 
         for (uint i; i < poolLength();) {
             _updatePool(i);
@@ -169,17 +159,14 @@ contract Reliquary is
                 allocPoint: allocPoint,
                 lastRewardTime: block.timestamp,
                 accRewardPerShare: 0,
+                firstEpochTime: block.timestamp,
                 name: name,
                 allowPartialWithdrawals: allowPartialWithdrawals
             })
         );
-        levels.push(
-            LevelInfo({
-                requiredMaturities: requiredMaturities,
-                multipliers: levelMultipliers,
-                balance: new uint[](levelMultipliers.length)
-            })
-        );
+        levels.push(LevelInfo({levelPeriod: levelPeriod, multipliers: levelMultipliers}));
+        uint[] memory empty;
+        tranches.push(TranchesInfo({balances: empty}));
 
         emit ReliquaryEvents.LogPoolAddition(
             (poolToken.length - 1), allocPoint, _poolToken, _rewarder, _nftDescriptor, allowPartialWithdrawals
@@ -212,6 +199,7 @@ contract Reliquary is
                 ++i;
             }
         }
+        // TODO: modify levels
 
         PoolInfo storage pool = poolInfo[pid];
         uint totalAlloc = totalAllocPoint + allocPoint - pool.allocPoint;
@@ -317,7 +305,7 @@ contract Reliquary is
         uint amount = position.amount;
         uint poolId = position.poolId;
 
-        levels[poolId].balance[position.level] -= amount;
+        tranches[poolId].balances[position.level] -= amount;
 
         _burn(relicId);
         delete positionForId[relicId];
@@ -438,7 +426,9 @@ contract Reliquary is
 
         PositionInfo storage fromPosition = positionForId[fromId];
         uint poolId = fromPosition.poolId;
-        if (!poolInfo[poolId].allowPartialWithdrawals) revert PartialWithdrawalsDisabled();
+        if (!poolInfo[poolId].allowPartialWithdrawals) {
+            revert PartialWithdrawalsDisabled();
+        }
 
         uint fromAmount = fromPosition.amount;
         uint newFromAmount = fromAmount - amount;
@@ -453,12 +443,12 @@ contract Reliquary is
         newPosition.poolId = poolId;
 
         uint multiplier = _updatePool(poolId) * levels[poolId].multipliers[level];
-        uint pendingFrom = fromAmount * multiplier / ACC_REWARD_PRECISION - fromPosition.rewardDebt;
+        uint pendingFrom = (fromAmount * multiplier) / ACC_REWARD_PRECISION - fromPosition.rewardDebt;
         if (pendingFrom != 0) {
             fromPosition.rewardCredit += pendingFrom;
         }
-        fromPosition.rewardDebt = newFromAmount * multiplier / ACC_REWARD_PRECISION;
-        newPosition.rewardDebt = amount * multiplier / ACC_REWARD_PRECISION;
+        fromPosition.rewardDebt = (newFromAmount * multiplier) / ACC_REWARD_PRECISION;
+        newPosition.rewardDebt = (amount * multiplier) / ACC_REWARD_PRECISION;
 
         emit ReliquaryEvents.CreateRelic(poolId, to, newId);
         emit ReliquaryEvents.Split(fromId, newId, amount);
@@ -494,7 +484,9 @@ contract Reliquary is
         LocalVariables_shift memory vars;
         PositionInfo storage fromPosition = positionForId[fromId];
         vars.poolId = fromPosition.poolId;
-        if (!poolInfo[vars.poolId].allowPartialWithdrawals) revert PartialWithdrawalsDisabled();
+        if (!poolInfo[vars.poolId].allowPartialWithdrawals) {
+            revert PartialWithdrawalsDisabled();
+        }
 
         PositionInfo storage toPosition = positionForId[toId];
         if (vars.poolId != toPosition.poolId) revert RelicsNotOfSamePool();
@@ -515,18 +507,19 @@ contract Reliquary is
 
         vars.accRewardPerShare = _updatePool(vars.poolId);
         vars.fromMultiplier = vars.accRewardPerShare * levels[vars.poolId].multipliers[vars.fromLevel];
-        vars.pendingFrom = vars.fromAmount * vars.fromMultiplier / ACC_REWARD_PRECISION - fromPosition.rewardDebt;
+        vars.pendingFrom = (vars.fromAmount * vars.fromMultiplier) / ACC_REWARD_PRECISION - fromPosition.rewardDebt;
         if (vars.pendingFrom != 0) {
             fromPosition.rewardCredit += vars.pendingFrom;
         }
-        vars.pendingTo = vars.toAmount * levels[vars.poolId].multipliers[vars.oldToLevel] * vars.accRewardPerShare
+        vars.pendingTo = (vars.toAmount * levels[vars.poolId].multipliers[vars.oldToLevel] * vars.accRewardPerShare)
             / ACC_REWARD_PRECISION - toPosition.rewardDebt;
         if (vars.pendingTo != 0) {
             toPosition.rewardCredit += vars.pendingTo;
         }
-        fromPosition.rewardDebt = vars.newFromAmount * vars.fromMultiplier / ACC_REWARD_PRECISION;
-        toPosition.rewardDebt = vars.newToAmount * vars.accRewardPerShare
-            * levels[vars.poolId].multipliers[vars.newToLevel] / ACC_REWARD_PRECISION;
+        fromPosition.rewardDebt = (vars.newFromAmount * vars.fromMultiplier) / ACC_REWARD_PRECISION;
+        toPosition.rewardDebt = (
+            vars.newToAmount * vars.accRewardPerShare * levels[vars.poolId].multipliers[vars.newToLevel]
+        ) / ACC_REWARD_PRECISION;
 
         emit ReliquaryEvents.Shift(fromId, toId, amount);
     }
@@ -560,14 +553,15 @@ contract Reliquary is
             _shiftLevelBalances(fromId, toId, poolId, fromAmount, toAmount, newToAmount);
 
         uint accRewardPerShare = _updatePool(poolId);
-        uint pendingTo = accRewardPerShare
-            * (fromAmount * levels[poolId].multipliers[fromLevel] + toAmount * levels[poolId].multipliers[oldToLevel])
-            / ACC_REWARD_PRECISION + fromPosition.rewardCredit - fromPosition.rewardDebt - toPosition.rewardDebt;
+        uint pendingTo = (
+            accRewardPerShare
+                * (fromAmount * levels[poolId].multipliers[fromLevel] + toAmount * levels[poolId].multipliers[oldToLevel])
+        ) / ACC_REWARD_PRECISION + fromPosition.rewardCredit - fromPosition.rewardDebt - toPosition.rewardDebt;
         if (pendingTo != 0) {
             toPosition.rewardCredit += pendingTo;
         }
         toPosition.rewardDebt =
-            newToAmount * accRewardPerShare * levels[poolId].multipliers[newToLevel] / ACC_REWARD_PRECISION;
+            (newToAmount * accRewardPerShare * levels[poolId].multipliers[newToLevel]) / ACC_REWARD_PRECISION;
 
         _burn(fromId);
         delete positionForId[fromId];
@@ -583,52 +577,30 @@ contract Reliquary is
     }
 
     /**
+     * TODO
      * @notice View function to see pending reward tokens on frontend.
      * @param relicId ID of the position.
      * @return pending reward amount for a given position owner.
      */
-    function pendingReward(uint relicId) public view override returns (uint pending) {
-        PositionInfo storage position = positionForId[relicId];
-        uint poolId = position.poolId;
-        PoolInfo storage pool = poolInfo[poolId];
-        uint accRewardPerShare = pool.accRewardPerShare;
-        uint lpSupply = _poolBalance(position.poolId);
+    // function pendingReward(uint relicId) public view override returns (uint pending) {
+    //     PositionInfo storage position = positionForId[relicId];
+    //     uint poolId = position.poolId;
+    //     PoolInfo storage pool = poolInfo[poolId];
+    //     uint accRewardPerShare = pool.accRewardPerShare;
+    //     uint lpSupply = _poolBalance(position.poolId);
 
-        uint lastRewardTime = pool.lastRewardTime;
-        uint secondsSinceReward = block.timestamp - lastRewardTime;
-        if (secondsSinceReward != 0 && lpSupply != 0) {
-            uint reward =
-                secondsSinceReward * _baseEmissionsPerSecond(lastRewardTime) * pool.allocPoint / totalAllocPoint;
-            accRewardPerShare += reward * ACC_REWARD_PRECISION / lpSupply;
-        }
+    //     uint lastRewardTime = pool.lastRewardTime;
+    //     uint secondsSinceReward = block.timestamp - lastRewardTime;
+    //     if (secondsSinceReward != 0 && lpSupply != 0) {
+    //         uint reward =
+    //             (secondsSinceReward * _baseEmissionsPerSecond(lastRewardTime) * pool.allocPoint) / totalAllocPoint;
+    //         accRewardPerShare += (reward * ACC_REWARD_PRECISION) / lpSupply;
+    //     }
 
-        uint leveledAmount = position.amount * levels[poolId].multipliers[position.level];
-        pending = leveledAmount * accRewardPerShare / ACC_REWARD_PRECISION + position.rewardCredit - position.rewardDebt;
-    }
-
-    /**
-     * @notice View function to see level of position if it were to be updated.
-     * @param relicId ID of the position.
-     * @return level Level for given position upon update.
-     */
-    function levelOnUpdate(uint relicId) public view override returns (uint level) {
-        PositionInfo storage position = positionForId[relicId];
-        LevelInfo storage levelInfo = levels[position.poolId];
-        uint length = levelInfo.requiredMaturities.length;
-        if (length == 1) {
-            return 0;
-        }
-
-        uint maturity = block.timestamp - position.entry;
-        for (level = length - 1; true;) {
-            if (maturity >= levelInfo.requiredMaturities[level]) {
-                break;
-            }
-            unchecked {
-                --level;
-            }
-        }
-    }
+    //     uint leveledAmount = position.amount * levels[poolId].multipliers[position.level];
+    //     pending =
+    //         (leveledAmount * accRewardPerShare) / ACC_REWARD_PRECISION + position.rewardCredit - position.rewardDebt;
+    // }
 
     /// @notice Returns the number of Reliquary pools.
     function poolLength() public view override returns (uint pools) {
@@ -657,27 +629,46 @@ contract Reliquary is
     }
 
     /// @dev Internal _updatePool function without nonReentrant modifier.
-    function _updatePool(uint pid) internal returns (uint accRewardPerShare) {
+    function _updatePool(uint pid) internal {
         if (pid >= poolLength()) revert NonExistentPool();
         PoolInfo storage pool = poolInfo[pid];
         uint timestamp = block.timestamp;
         uint lastRewardTime = pool.lastRewardTime;
         uint secondsSinceReward = timestamp - lastRewardTime;
 
-        accRewardPerShare = pool.accRewardPerShare;
+        uint accRewardPerShare = pool.accRewardPerShare;
         if (secondsSinceReward != 0) {
-            uint lpSupply = _poolBalance(pid);
+            uint _epoch = (lastRewardTime - pool.firstEpochTime) / levels[pid].levelPeriod;
+            while (true) {
+                uint nextEpochTimestamp = pool.firstEpochTime + (_epoch + 1) * levels[pid].levelPeriod;
+                uint lpSupply = _poolBalanceAtEpoch(pid, _epoch);
 
-            if (lpSupply != 0) {
-                uint reward =
-                    secondsSinceReward * _baseEmissionsPerSecond(lastRewardTime) * pool.allocPoint / totalAllocPoint;
-                accRewardPerShare += reward * ACC_REWARD_PRECISION / lpSupply;
-                pool.accRewardPerShare = accRewardPerShare;
+                bool calculatingLastEpoch = nextEpochTimestamp > timestamp;
+
+                if (lpSupply == 0) {
+                    if (calculatingLastEpoch) break;
+                    _epoch += 1;
+                    continue;
+                }
+
+                uint endTimestamp = calculatingLastEpoch ? nextEpochTimestamp : timestamp;
+
+                uint reward = (
+                    secondsSinceReward * _baseEmissionsPerSecond(lastRewardTime, endTimestamp) * pool.allocPoint
+                ) / totalAllocPoint;
+                accRewardPerShare += (reward * ACC_REWARD_PRECISION) / lpSupply;
+
+                if (calculatingLastEpoch) {
+                    break;
+                } else {
+                    lastRewardTime = nextEpochTimestamp;
+                    _epoch += 1;
+                }
             }
-
             pool.lastRewardTime = timestamp;
+            pool.accRewardPerShare = accRewardPerShare;
 
-            emit ReliquaryEvents.LogUpdatePool(pid, timestamp, lpSupply, accRewardPerShare);
+            emit ReliquaryEvents.LogUpdatePool(pid, timestamp, tranches[pid].totalBalance, accRewardPerShare);
         }
     }
 
@@ -717,8 +708,11 @@ contract Reliquary is
         LocalVariables_updatePosition memory vars;
         PositionInfo storage position = positionForId[relicId];
         poolId = position.poolId;
-        vars.accRewardPerShare = _updatePool(poolId);
+        PoolInfo storage pool = poolInfo[poolId];
+        _updatePool(poolId);
+        uint[] storage accRewardsPerShare = poolInfo[poolId].accRewardsPerShare;
 
+        // TODO: update
         vars.oldAmount = position.amount;
         if (kind == Kind.DEPOSIT) {
             _updateEntry(amount, relicId);
@@ -734,21 +728,21 @@ contract Reliquary is
             vars.newAmount = vars.oldAmount;
         }
 
-        vars.oldLevel = position.level;
-        vars.newLevel = _updateLevel(relicId, vars.oldLevel);
-        if (vars.oldLevel != vars.newLevel) {
-            levels[poolId].balance[vars.oldLevel] -= vars.oldAmount;
-            levels[poolId].balance[vars.newLevel] += vars.newAmount;
-        } else if (kind == Kind.DEPOSIT) {
-            levels[poolId].balance[vars.oldLevel] += amount;
-        } else if (kind == Kind.WITHDRAW) {
-            levels[poolId].balance[vars.oldLevel] -= amount;
+        // iterate over every level since last claim
+        uint _epoch = (position.lastClaim - pool.firstEpochTime) / levels[poolId].levelPeriod;
+        uint levelZeroEpoch = (position.entry - pool.firstEpochTime) / levels[poolId].levelPeriod;
+        uint _pendingReward;
+        while (pool.firstEpochTime + (levels[poolId].levelPeriod * _epoch) > block.timestamp) {
+            uint nextEpochTimestamp = poolInfo[poolId].firstEpochTime + (_epoch + 1) * levels[poolId].levelPeriod;
+            _pendingReward += (
+                vars.oldAmount * levels[poolId].multipliers[_epoch - levelZeroEpoch] * vars.accRewardPerShare[_epoch]
+            ) / ACC_REWARD_PRECISION - position.rewardDebt[_epoch];
+            // TODO: should this be necessary for past epochs, since claims only check after last claim?
+            position.rewardDebt[_epoch] = (
+                vars.newAmount * levels[poolId].multipliers[_epoch - levelZeroEpoch] * vars.accRewardPerShare[_epoch]
+            ) / ACC_REWARD_PRECISION;
+            _epoch++;
         }
-
-        uint _pendingReward = vars.oldAmount * levels[poolId].multipliers[vars.oldLevel] * vars.accRewardPerShare
-            / ACC_REWARD_PRECISION - position.rewardDebt;
-        position.rewardDebt =
-            vars.newAmount * levels[poolId].multipliers[vars.newLevel] * vars.accRewardPerShare / ACC_REWARD_PRECISION;
 
         vars.harvest = harvestTo != address(0);
         if (!vars.harvest && _pendingReward != 0) {
@@ -793,22 +787,7 @@ contract Reliquary is
             uint weight = _findWeight(amount, amountBefore);
             uint entryBefore = position.entry;
             uint maturity = block.timestamp - entryBefore;
-            position.entry = entryBefore + maturity * weight / 1e12;
-        }
-    }
-
-    /**
-     * @notice Updates the position's level based on entry time.
-     * @param relicId The NFT ID of the position being updated.
-     * @param oldLevel Level of position before update.
-     * @return newLevel Level of position after update.
-     */
-    function _updateLevel(uint relicId, uint oldLevel) internal returns (uint newLevel) {
-        newLevel = levelOnUpdate(relicId);
-        PositionInfo storage position = positionForId[relicId];
-        if (oldLevel != newLevel) {
-            position.level = newLevel;
-            emit ReliquaryEvents.LevelChanged(relicId, newLevel);
+            position.entry = entryBefore + (maturity * weight) / 1e12;
         }
     }
 
@@ -839,23 +818,32 @@ contract Reliquary is
     /**
      * @notice returns The total deposits of the pool's token, weighted by maturity level allocation.
      * @param pid The index of the pool. See poolInfo.
+     * @param epoch The epoch to calculate the pool balance at.
      * @return total The amount of pool tokens held by the contract.
      */
-    function _poolBalance(uint pid) internal view returns (uint total) {
+    function _poolBalanceAtEpoch(uint pid, uint epoch) internal view returns (uint total) {
         LevelInfo storage levelInfo = levels[pid];
-        uint length = levelInfo.balance.length;
-        for (uint i; i < length;) {
-            total += levelInfo.balance[i] * levelInfo.multipliers[i];
+        TranchesInfo storage _tranches = tranches[pid];
+        uint levelsLength = levelInfo.multipliers.length;
+        uint lastMultiplier = levelInfo.multipliers[levelsLength - 1];
+        uint realTotal;
+        for (uint i; (i < _tranches.balances.length && i < levelsLength);) {
+            realTotal += _tranches.balances[epoch - i];
+            total += _tranches.balances[epoch - i] * levelInfo.multipliers[i];
             unchecked {
                 ++i;
             }
         }
+        // calculate any balance in the remaining tranches with the last multiplier
+        total += (_tranches.totalBalance - realTotal) * lastMultiplier;
     }
 
     /// @notice Require the sender is either the owner of the Relic or approved to transfer it.
     /// @param relicId The NFT ID of the Relic.
     function _requireApprovedOrOwner(uint relicId) internal view {
-        if (!_isApprovedOrOwner(msg.sender, relicId)) revert NotApprovedOrOwner();
+        if (!_isApprovedOrOwner(msg.sender, relicId)) {
+            revert NotApprovedOrOwner();
+        }
     }
 
     /**
@@ -865,12 +853,29 @@ contract Reliquary is
      */
     function _findWeight(uint addedValue, uint oldValue) internal pure returns (uint weightNew) {
         if (oldValue < addedValue) {
-            weightNew = 1e12 - oldValue * 1e12 / (addedValue + oldValue);
+            weightNew = 1e12 - (oldValue * 1e12) / (addedValue + oldValue);
         } else if (addedValue < oldValue) {
-            weightNew = addedValue * 1e12 / (addedValue + oldValue);
+            weightNew = (addedValue * 1e12) / (addedValue + oldValue);
         } else {
             weightNew = 5e11;
         }
+    }
+
+    function _currentEpoch(uint poolId) internal view returns (uint epoch) {
+        epoch = block.timestamp / levels[poolId].levelPeriod;
+    }
+
+    function _balanceForLevel(uint poolId, uint level) internal pure returns (uint balance) {
+        LevelInfo storage levelInfo = levels[poolId];
+        uint length = levelInfo.balance.length;
+        if (level >= length) revert NonExistentLevel();
+        balance = levelInfo.balance[level];
+    }
+
+    function _positionLevelAt(uint relicId, level) internal view returns (uint level) {
+        PositionInfo storage position = positionForId[relicId];
+        uint poolId = position.poolId;
+        level = (position.lastClaim - poolInfo[poolId].firstEpochTime) / levels[poolId].levelPeriod;
     }
 
     /// @dev Handle updating balances for each affected tranche when shifting and merging.
