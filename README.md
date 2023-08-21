@@ -18,7 +18,8 @@ Main data structures changed:
 
 - positions' `rewardDebt` changed to an array, storing debts for each epoch
 - pools' accRewardPerShares changed to an array for the same reason
-- all levels must have the same duration
+- ~all levels must have the same duration~
+  - a level's duration could be given in epoches, so `_poolBalanceAtEpoch` (presumably the most gas intensive computation) could be slightly optimized.
 - balances for each tranche are now stored by "epoch" instead of levels. `balances[0]` = sum of positions staked during the pool's first epoch, always.
 
 Users don't need to update their positions to "claim" a new level, as the contract can calculate rewards over each level since the last time a position was updated.
